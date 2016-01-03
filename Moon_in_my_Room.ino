@@ -1,46 +1,114 @@
+/*
+ * Moon_in_my_Room sketch
+ * 
+ * Used http://www.imagitronics.org/projects/rc-moon/ and 
+ * http://www.instructables.com/id/Arduino-Controlled-Model-Moon-synchronizes-phase-c/
+ * as references
+ * 
+ * Get schematic from: https://github.com/mperlman1/Moon-in-my-Room
+ * 
+ * Requires libraries:
+ * RTC_DS3231 (https://github.com/mizraith/RTClib)
+ * Tlc5940 (https://code.google.com/p/tlc5940arduino/)
+ * 
+ * Assumes that RTC is already set to current date/time
+ * The exact setting is mostly irrelevant since this just uses the year/month/day to
+ * calculate the phase
+ * 
+ * Basic logic:
+ * Turn on when the room is dark
+ * Get moon phase based on current date
+ * Activate moon segments and scroll through colors
+ * Turn off after a period of time or when the room is light
+ * 
+ */
+
 #include <avr/sleep.h>
 #include <Wire.h>
 #include "Tlc5940.h"
 #include <SPI.h>
 #include "RTC_DS3231.h"
 
-RTC_DS3231 RTC;
-int led1GreenPin = 5;
-int led1BluePin = 6;
-int ldrPin = 2;                      // pin for the LDR to sense light in the room
-volatile boolean started = true;     // boolean to indicate that we have just awakened from sleep
-int fullYear;                        // full year (ie 2009) to be retrieved from EEPROM
-byte second, minute, hour, dayOfWeek, dayOfMonth, month, year;
-                                     // date and time retrieved from DS3231 RTC module
-long turnOffTime;                    // time (in seconds past the epoch) to turn off to conserve battery
+// uncomment the following line to turn on serial logging
+// NOTE: this will likely break the color cycling
+//#define DEBUG
 
-void setup() {                       // arduino setup routine
+RTC_DS3231 RTC;
+
+int led1GreenPin = 5;                // green cathode for LED 1
+int led1BluePin = 6;                 // blue cathode for LED 1
+int ldrPin = 2;                      // pin for the LDR to sense light in the room
+
+volatile boolean initialized = false;// boolean to indicate that we have just awakened from sleep
+
+long turnOnTime, turnOffTime;        // time (in seconds past the epoch) that the moon turned on and
+                                     // when it's planned to turn off to conserve battery
+
+long currentMillis, previousMillis;  // current time (in millis) and time of last time check
+long nextColorCycle;                 // time (in millis) when the next color cycle will begin
+const int stepDuration = 100;        // duration (in millis) of each cycle step
+const int minCycleDuration = 3000;   // minimum color cycle duration (in milliseconds)
+const int maxCycleDuration = 8000;   // maximum color cycle duration (in milliseconds)
+int cycleSteps, currentCycleStep;    // total cycle steps and current step number
+int redTarget[6], greenTarget[6], blueTarget[6];
+                                     // target colors for the current color cycle
+int currentRed[6], currentGreen[6], currentBlue[6];
+                                     // current RGB value
+int redStep[6], greenStep[6], blueStep[6];
+                                     // step size for each color in current cycle
+
+boolean activeSegments[6];           // array that identifies which segements should be one for this phase
+
+const int minOnTime = 720;           // minimum time to run (in seconds) when the room is dark
+const int maxOnTime = 1080;          // maximum time to run (in seconds) when the room is dark
+// NOTE: standard Moon in my Room run time appears to be ~30 min
+
+
+void setup() {
+  #ifdef DEBUG
   Serial.begin(9600);                // open serial communications to PC for updates
-  Wire.begin();                      // begin communication with DS1307 RTC module
+  #endif
+  
+  Wire.begin();                      // begin communication with RTC module
   RTC.begin();
   Tlc.init();
 
-  pinMode(ldrPin, INPUT);            // configure the LDR pin as input                                 
+  pinMode(ldrPin, INPUT);                                
   pinMode(led1GreenPin, OUTPUT);
   pinMode(led1BluePin, OUTPUT);
   analogWrite(led1GreenPin, 255);
   analogWrite(led1BluePin, 255);
+
+  randomSeed(analogRead(0));
 }
 
 void loop() {
-  //Serial.println("IN THE LOOP");
-  DateTime now = RTC.now();
-  
-  if(digitalRead(ldrPin)) {          // if ldrPin is high, the room is too bright to operate
+  if((digitalRead(ldrPin)) || moonIsReadyToSleep()) {          // if ldrPin is high, the room is too bright to operate
+    #ifdef DEBUG
     Serial.println("going to sleep");
-    updateMoon(0);
+    #endif
+    turnMoonOff();
     delay(10);
     sleepNow();                      // so we sleep to arduino to conserve battery
   }
-  
-  if(started) {                      // if the device has just awakened from sleep
-    started = false;                 // it has no longer 'just' awakened, so this
-                                     // code should only be run once
+
+  if(!initialized) {
+    /*
+     * This is more or less a setup() function inside the main loop to perform initial
+     * housekeeping when the moon wakes up.
+     * 
+     * Basic logic
+     * Turn everything off
+     * Read the current date
+     * Identify the moon phase and determine which segments are active
+     * Determine how long to run
+     * Initialize the color cycle
+     */
+    initialized = true;
+    turnMoonOff();
+    DateTime now = RTC.now();
+    
+    #ifdef DEBUG
     Serial.print(now.year(), DEC);
     Serial.print('/');
     Serial.print(now.month(), DEC);
@@ -53,67 +121,81 @@ void loop() {
     Serial.print(':');
     Serial.print(now.second(), DEC);
     Serial.println();
-    
-    second = now.second();
-    minute = now.minute();
-    hour = now.hour();
-    dayOfMonth = now.day();
-    month = now.month();
-    year = now.year()-2000;
-    fullYear = now.year();  // get the full four year date
+    #endif
 
-    turnOffTime = now.unixtime() + 15 * 60; // turn off in 15 minutes
-                                     
-    Serial.print("second ");
-    Serial.println(second, DEC);
-    Serial.print("minute ");
-    Serial.println(minute, DEC);
-    Serial.print("hour ");
-    Serial.println(hour, DEC);
-    Serial.print("dayofweek ");
-    Serial.println(dayOfWeek, DEC);
-    Serial.print("dayOfMonth ");
-    Serial.println(dayOfMonth, DEC);
-    Serial.print("month ");
-    Serial.println(month, DEC);
-    Serial.print("fullyear ");
-    Serial.println(fullYear, DEC);
-    
-    updateMoon(getPhase(fullYear, int(month), int(dayOfMonth)));
+    setPhase(now.year(), now.month(), now.day());
 
+    turnOnTime = now.unixtime();
+    turnOffTime = turnOnTime + random(minOnTime, maxOnTime + 1);
+
+    #ifdef DEBUG
+    Serial.print("Turned on: ");
+    Serial.println(turnOnTime);
+    Serial.print("Plan to turn off: ");
+    Serial.println(turnOffTime);
+    #endif
+
+    for (int segment = 0; segment < 6; segment++) {
+      switch (segment) {
+        case 0:
+          currentRed[segment] = random(0, 4096);
+          currentGreen[segment] = 255 - random(0, 256);
+          currentBlue[segment] = 255 - random(0, 256);
+          break;
+        default:
+          currentRed[segment] = random(0, 4096);
+          currentGreen[segment] = random(0, 4096);
+          currentBlue[segment] = random(0, 4096);
+          break;
+      }
+    }
+    establishNextColorCycle();
   }
+
+  if(initialized) {
+    updateMoon();
+  }
+  
 } 
 
-void wakeNow() {                    // here the interrupt is handled after wakeup
-  started = true;                   // variable establishes that we have just awakened
+void wakeNow() {
+  /*
+   * Interrupt handler. Only action is to set value of initialized to false.
+   */
+  initialized = false;
 }
 
 
-void sleepNow() {                    // put the arduino to sleep
-    started = false;
+void sleepNow() {
+  /*
+   * Put the moon to sleep. Only wake up when the room goes from light to dark.
+   */
     set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-    //set_sleep_mode(SLEEP_MODE_IDLE);
-    sleep_enable();                  // enables the sleep bit in the mcucr register
-                                     // so sleep is possible. just a safety pin 
-    attachInterrupt(digitalPinToInterrupt(2), wakeNow, LOW);
-                                     // use interrupt on pin 2 and run function wakeNow
-    sleep_mode();                    // put the arduino to sleep!
+    sleep_enable();
+    attachInterrupt(digitalPinToInterrupt(ldrPin), wakeNow, FALLING);
+    sleep_mode();
     
     // THE PROGRAM CONTINUES FROM HERE AFTER WAKING UP
-    sleep_disable();                 // first thing after waking from sleep
+    sleep_disable();
     detachInterrupt(digitalPinToInterrupt(2));
-                                     // disables interrupt on pin 2 so the 
-                                     // wakeUpNow code will not be executed 
-    delay(10);                      // during normal operation and wait a bit
+    delay(10);
 }
 
 
-byte getPhase(int Y, int M, int D) {  // calculate the current phase of the moon
-  double AG, IP;                      // based on the current date
-  byte phase;                         // algorithm adapted from Stephen R. Schmitt's
-                                      // Lunar Phase Computation program, originally
-  long YY, MM, K1, K2, K3, JD;        // written in the Zeno programming language
-                                      // http://home.att.net/~srschmitt/lunarphasecalc.html
+void setPhase(int Y, int M, int D) {
+  /*
+   * caculate the current phase of the moon and set the active segments
+   * 
+   * based on the current date algorithm adapted from Stephen R. Schmitt's
+   * Lunar Phase Computation program, originally written in the Zeno
+   * programming language (http://home.att.net/~srschmitt/lunarphasecalc.html)
+   * 
+   */
+  double AG, IP;
+  byte phase;
+
+  long YY, MM, K1, K2, K3, JD;
+                              
   // calculate julian date
   YY = Y - floor((12 - M) / 10);
   MM = M + 9;
@@ -128,48 +210,35 @@ byte getPhase(int Y, int M, int D) {  // calculate the current phase of the moon
   if(JD > 2299160)
     JD = JD -K3;
 
-  Serial.print("Julian date: ");
-  Serial.println(JD);
-  
   IP = normalize((JD - 2451550.1) / 29.530588853);
   AG = IP*29.53;
-
-  Serial.print("IP: ");
-  Serial.println(IP);
-  Serial.print("AG: ");
-  Serial.println(AG);
   
   if(AG < 1.20369)
-    phase = B00000000;
+    setActiveSegments(false, false, false, false, false, false);
   else if(AG < 3.61108)
-    phase = B00000001;
+    setActiveSegments(true, false, false, false, false, false);
   else if(AG < 6.01846)
-    phase = B00000011;
+    setActiveSegments(true, true, false, false, false, false);
   else if(AG < 8.42595)
-    phase = B00000111;
+    setActiveSegments(true, true, true, false, false, false);
   else if(AG < 10.83323)
-    phase = B00001111;
+    setActiveSegments(true, true, true, true, false, false);
   else if(AG < 13.24062)
-    phase = B00011111;
+    setActiveSegments(true, true, true, true, true, false);
   else if(AG < 15.64800)
-    phase = B00111111;
+    setActiveSegments(true, true, true, true, true, true);
   else if(AG < 18.05539)
-    phase = B00111110;
+    setActiveSegments(false, true, true, true, true, true);
   else if(AG < 20.46277)
-    phase = B00111100;
+    setActiveSegments(false, false, true, true, true, true);
   else if(AG < 22.87016)
-    phase = B00111000;
+    setActiveSegments(false, false, false, true, true, true);
   else if(AG < 25.27754)
-    phase = B00110000;
+    setActiveSegments(false, false, false, false, true, true);
   else if(AG < 27.68493)
-    phase = B00100000;
+    setActiveSegments(false, false, false, false, false, true);
   else
-    phase = 0;
-
-  Serial.print("Phase: ");
-  Serial.println(phase);
-  
-  return phase;    
+    setActiveSegments(false, false, false, false, false, false);
 }
 
 double normalize(double v) {           // normalize moon calculation between 0-1
@@ -179,104 +248,179 @@ double normalize(double v) {           // normalize moon calculation between 0-1
     return v;
 }
 
-void updateMoon(byte thePhase) {
-  for(byte mask = 00000001, j=7; mask<01000000, j<13; mask<<=1, j++) {
-    Serial.print("Mask: ");
-    Serial.println(mask);
-    Serial.print("j: ");
-    Serial.println(j);
-    Serial.print("Bit mask: ");
-    Serial.println(thePhase & mask);
-    if((thePhase & mask))
-      turnOnMoonSegment(j);
-    else
-      turnOffMoonSegment(j);
+void updateMoon() {
+  currentMillis = millis();
+
+  #ifdef DEBUG
+  Serial.print("Current: ");
+  Serial.println(currentMillis);
+  Serial.print("Previous: ");
+  Serial.println(previousMillis);
+  #endif
+  
+  if((currentMillis - previousMillis) < stepDuration) return;
+
+  previousMillis = currentMillis;
+
+  #ifdef DEBUG
+  Serial.print("Current Millis: ");
+  Serial.println(currentMillis);
+  Serial.print("Next Cycle Start: ");
+  Serial.println(nextColorCycle);
+  Serial.print("Current Cycle Step: ");
+  Serial.println(currentCycleStep);
+  Serial.print("Cycle Steps: ");
+  Serial.println(cycleSteps);
+  #endif
+
+  if ((currentCycleStep == cycleSteps) || (currentMillis >= nextColorCycle)) 
+    establishNextColorCycle();
+
+  for (int segment = 0; segment < 6; segment++) {
+    currentRed[segment] += redStep[segment];
+    currentGreen[segment] += greenStep[segment];
+    currentBlue[segment] += blueStep[segment];
   }
+  currentCycleStep++;
+
+  #ifdef DEBUG
+  Serial.print("Cycle Step: ");
+  Serial.println(currentCycleStep);
+  #endif
+
+  for (int segment = 5; segment >=0; segment--) {
+    #ifdef DEBUG
+    Serial.print("Segment: ");
+    Serial.println(segment);
+    #endif
+    if (activeSegments[segment] == false) continue;
+    switch (segment) {
+    case 0:
+      #ifdef DEBUG
+      Serial.print("Adjusting segment: ");
+      Serial.println(segment);
+      #endif
+      Tlc.set(0, currentRed[segment]);
+      analogWrite(led1GreenPin, currentGreen[segment]);
+      analogWrite(led1BluePin, currentBlue[segment]);
+      break;
+    case 1:
+      #ifdef DEBUG
+      Serial.print("Adjusting segment: ");
+      Serial.println(segment);
+      #endif
+      Tlc.set(1, currentRed[segment]);
+      Tlc.set(2, currentGreen[segment]);
+      Tlc.set(3, currentBlue[segment]);
+      break;
+    case 2:
+      #ifdef DEBUG
+      Serial.print("Adjusting segment: ");
+      Serial.println(segment);
+      #endif
+      Tlc.set(4, currentRed[segment]);
+      Tlc.set(5, currentGreen[segment]);
+      Tlc.set(6, currentBlue[segment]);
+      break;
+    case 3:
+      #ifdef DEBUG
+      Serial.print("Adjusting segment: ");
+      Serial.println(segment);
+      #endif
+      Tlc.set(7, currentRed[segment]);
+      Tlc.set(8, currentGreen[segment]);
+      Tlc.set(9, currentBlue[segment]);
+      break;
+    case 4:
+      #ifdef DEBUG
+      Serial.print("Adjusting segment: ");
+      Serial.println(segment);
+      #endif
+      Tlc.set(10, currentRed[segment]);
+      Tlc.set(11, currentGreen[segment]);
+      Tlc.set(12, currentBlue[segment]);
+      break;
+    case 5:
+      #ifdef DEBUG
+      Serial.print("Adjusting segment: ");
+      Serial.println(segment);
+      #endif
+      Tlc.set(13, currentRed[segment]);
+      Tlc.set(14, currentGreen[segment]);
+      Tlc.set(15, currentBlue[segment]);
+      break;
+    }
+  }
+  Tlc.update();
 }
 
-void turnOnMoonSegment(byte segment) {
-  Serial.print("In TurnOnMoonSegment for segment: ");
-  Serial.println(segment);
-  switch (segment) {
-    case 7:
-      Tlc.set(0, 4095);
-      Tlc.update();
-      digitalWrite(led1GreenPin, HIGH);
-      digitalWrite(led1BluePin, HIGH);
-      break;
-    case 8:
-      Tlc.set(1, 0);
-      Tlc.set(2, 626);
-      Tlc.set(3, 2216);
-      Tlc.update();
-      break;
-    case 9:
-      Tlc.set(4, 0);
-      Tlc.set(5, 4095);
-      Tlc.set(6, 4095);
-      Tlc.update();
-      break;
-    case 10:
-      Tlc.set(7, 0);
-      Tlc.set(8, 2056);
-      Tlc.set(9, 0);
-      Tlc.update();
-      break;
-    case 11:
-      Tlc.set(10, 4095);
-      Tlc.set(11, 0);
-      Tlc.set(12, 0);
-      Tlc.update();
-      break;
-    case 12:
-      Tlc.set(13, 2056);
-      Tlc.set(14, 0);
-      Tlc.set(15, 2056);
-      Tlc.update();
-      break;
-  }
+void turnMoonOff() {
+  Tlc.clear();
+  Tlc.update();
+  digitalWrite(led1GreenPin, HIGH);
+  digitalWrite(led1BluePin, HIGH);
 }
 
-void turnOffMoonSegment(byte segment) {
-  Serial.print("In TurnOffMoonSegment for segment: ");
-  Serial.println(segment);
-  switch (segment) {
-    case 7:
-      Tlc.set(0, 0);
-      Tlc.update();
-      digitalWrite(led1GreenPin, HIGH);
-      digitalWrite(led1BluePin, HIGH);
-      break;
-    case 8:
-      Tlc.set(1, 0);
-      Tlc.set(2, 0);
-      Tlc.set(3, 0);
-      Tlc.update();
-      break;
-    case 9:
-      Tlc.set(4, 0);
-      Tlc.set(5, 0);
-      Tlc.set(6, 0);
-      Tlc.update();
-      break;
-    case 10:
-      Tlc.set(7, 0);
-      Tlc.set(8, 0);
-      Tlc.set(9, 0);
-      Tlc.update();
-      break;
-    case 11:
-      Tlc.set(10, 0);
-      Tlc.set(11, 0);
-      Tlc.set(12, 0);
-      Tlc.update();
-      break;
-    case 12:
-      Tlc.set(13, 0);
-      Tlc.set(14, 0);
-      Tlc.set(15, 0);
-      Tlc.update();
-      break;
-  }
+boolean moonIsReadyToSleep() {
+  /*
+   * Determine if the moon is ready to sleep
+   * 
+   * Don't evaluate if the moon isn't initialized
+   * 
+   * Possible turn off conditions:
+   * Moon has been on long enough
+   * New moon (nothing is lit up so conserve energy and sleep)
+   * 
+   */
+  if(!initialized) return false;
+  DateTime now = RTC.now();
+  if(turnOffTime < now.unixtime()) return true;
+  if((activeSegments[0] == false) && (activeSegments[1] == false) &&
+     (activeSegments[2] == false) && (activeSegments[3] == false) &&
+     (activeSegments[4] == false) && (activeSegments[5] == false)) return true;
+  return false;
 }
 
+void setActiveSegments(boolean first, boolean second, boolean third, boolean fourth, boolean fifth, boolean sixth) {
+  activeSegments[0] = first;
+  activeSegments[1] = second;
+  activeSegments[2] = third;
+  activeSegments[3] = fourth;
+  activeSegments[4] = fifth;
+  activeSegments[5] = sixth;
+}
+
+void establishNextColorCycle() {
+  currentMillis = millis();
+  previousMillis = currentMillis;
+  nextColorCycle = currentMillis + random(minCycleDuration, maxCycleDuration + 1);
+  currentCycleStep = 0;
+  cycleSteps = (nextColorCycle - currentMillis) / stepDuration;
+  
+  for (int segment = 0; segment < 6; segment++) {
+    switch(segment) {
+      case 0:
+        redTarget[segment] = random(0, 4096);
+        greenTarget[segment] = 255 - random(0, 256);
+        blueTarget[segment] = 255 - random(0, 256);
+        break;
+      default:
+        redTarget[segment] = random(0, 4096);
+        greenTarget[segment] = random(0, 4096);
+        blueTarget[segment] = random(0, 4096);
+        break;
+    }
+    redStep[segment] = (redTarget[segment] - currentRed[segment]) / cycleSteps;
+    greenStep[segment] = (greenTarget[segment] - currentGreen[segment]) / cycleSteps;
+    blueStep[segment] = (blueTarget[segment] - currentBlue[segment]) / cycleSteps;
+  }
+
+  #ifdef DEBUG
+  Serial.print("Current millis: ");
+  Serial.println(currentMillis);
+  Serial.print("Next cycle start: ");
+  Serial.println(nextColorCycle);
+  Serial.print("Steps in cycle: ");
+  Serial.println(cycleSteps);
+  #endif
+}
